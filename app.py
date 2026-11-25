@@ -1,154 +1,449 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="Quotex AI Signal Pro", page_icon="📈", layout="wide")
-st.title("QUOTEX AI SIGNAL PRO")
-st.caption("Read-only research dashboard • No automatic trading • Historical results are not guarantees")
-
-st.warning(
-    "ডেটা সতর্কতা: Quotex OTC-এর আসল ক্যান্ডেল ডেটা ছাড়া OTC ফলাফল যাচাই করা যায় না। "
-    "এই অ্যাপ নিজে থেকে Quotex-এ লগইন করে না এবং কোনো লাইভ/OTC ডেটা বানিয়ে দেখায় না।"
+st.set_page_config(
+    page_title="Quotex AI Signal Pro",
+    page_icon="📈",
+    layout="wide"
 )
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+st.title("QUOTEX AI SIGNAL PRO")
+st.caption("Historical market analysis | Educational use only")
 
-def enrich(df):
+st.warning(
+    "এই অ্যাপ CSV ডেটা বিশ্লেষণ করে। "
+    "এটি Quotex-এর লাইভ বা OTC ডেটা নিজে সংগ্রহ করে না। "
+    "কোনো সিগন্যাল লাভের নিশ্চয়তা দেয় না।"
+)
+
+
+def calculate_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0)
+
+    return rsi
+
+
+def analyze_data(df):
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
-    required = {"open", "high", "low", "close"}
-    if not required.issubset(df.columns):
-        raise ValueError("CSV-তে open, high, low, close কলাম থাকতে হবে।")
-    for c in ["open", "high", "low", "close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-    df["ema9"] = df.close.ewm(span=9, adjust=False).mean()
-    df["ema21"] = df.close.ewm(span=21, adjust=False).mean()
-    df["ema50"] = df.close.ewm(span=50, adjust=False).mean()
-    df["rsi"] = rsi(df.close)
-    fast = df.close.ewm(span=12, adjust=False).mean()
-    slow = df.close.ewm(span=26, adjust=False).mean()
-    df["macd"] = fast - slow
-    df["macd_signal"] = df.macd.ewm(span=9, adjust=False).mean()
-    df["body"] = (df.close - df.open).abs()
-    df["range"] = (df.high - df.low).replace(0, np.nan)
-    df["bull_engulf"] = (
-        (df.close > df.open) & (df.close.shift(1) < df.open.shift(1)) &
-        (df.close >= df.open.shift(1)) & (df.open <= df.close.shift(1))
-    )
-    df["bear_engulf"] = (
-        (df.close < df.open) & (df.close.shift(1) > df.open.shift(1)) &
-        (df.close <= df.open.shift(1)) & (df.open >= df.close.shift(1))
-    )
-    # Causal rolling levels: current candle is excluded from its own reference window.
-    prev_high = df.high.shift(1).rolling(20).max()
-    prev_low = df.low.shift(1).rolling(20).min()
-    df["bull_sweep"] = (df.low < prev_low) & (df.close > prev_low)
-    df["bear_sweep"] = (df.high > prev_high) & (df.close < prev_high)
-    return df
 
-def signals(df):
+    required = ["open", "high", "low", "close"]
+
+    missing = [c for c in required if c not in df.columns]
+
+    if missing:
+        raise ValueError(
+            "CSV-তে প্রয়োজনীয় কলাম নেই: " + ", ".join(missing)
+        )
+
+    for c in required:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=required)
+
+    time_col = next(
+        (c for c in ["timestamp", "time"] if c in df.columns),
+        None
+    )
+
+    if time_col:
+        parsed = pd.to_datetime(df[time_col], errors="coerce")
+        if parsed.notna().any():
+            df["_sort_time"] = parsed
+            df = df.sort_values("_sort_time")
+
+    invalid = (
+        (df["high"] < df["low"]) |
+        (df["high"] < df["open"]) |
+        (df["high"] < df["close"]) |
+        (df["low"] > df["open"]) |
+        (df["low"] > df["close"])
+    )
+
+    removed = int(invalid.sum())
+    df = df.loc[~invalid].reset_index(drop=True)
+
+    if len(df) < 60:
+        raise ValueError("কমপক্ষে ৬০টি সঠিক ক্যান্ডেল প্রয়োজন।")
+
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    df["rsi"] = calculate_rsi(df["close"])
+
+    fast = df["close"].ewm(span=12, adjust=False).mean()
+    slow = df["close"].ewm(span=26, adjust=False).mean()
+
+    df["macd"] = fast - slow
+    df["macd_signal"] = df["macd"].ewm(
+        span=9, adjust=False
+    ).mean()
+
+    df["bull_engulf"] = (
+        (df["close"] > df["open"]) &
+        (df["close"].shift(1) < df["open"].shift(1)) &
+        (df["close"] >= df["open"].shift(1)) &
+        (df["open"] <= df["close"].shift(1))
+    )
+
+    df["bear_engulf"] = (
+        (df["close"] < df["open"]) &
+        (df["close"].shift(1) > df["open"].shift(1)) &
+        (df["close"] <= df["open"].shift(1)) &
+        (df["open"] >= df["close"].shift(1))
+    )
+
+    previous_high = df["high"].shift(1).rolling(20).max()
+    previous_low = df["low"].shift(1).rolling(20).min()
+
+    df["support"] = previous_low
+    df["resistance"] = previous_high
+
+    df["bull_sweep"] = (
+        (df["low"] < previous_low) &
+        (df["close"] > previous_low)
+    )
+
+    df["bear_sweep"] = (
+        (df["high"] > previous_high) &
+        (df["close"] < previous_high)
+    )
+
+    return df, removed
+
+
+def make_signals(df):
     d = df.copy()
-    score = np.zeros(len(d), dtype=int)
-    score += (d.close > d.ema21).fillna(False).astype(int)
-    score += (d.ema9 > d.ema21).fillna(False).astype(int)
-    score += (d.macd > d.macd_signal).fillna(False).astype(int)
-    score += ((d.rsi >= 50) & (d.rsi <= 70)).fillna(False).astype(int)
-    score += d.bull_engulf.fillna(False).astype(int)
-    score += d.bull_sweep.fillna(False).astype(int)
+
+    bull = np.zeros(len(d), dtype=int)
     bear = np.zeros(len(d), dtype=int)
-    bear += (d.close < d.ema21).fillna(False).astype(int)
-    bear += (d.ema9 < d.ema21).fillna(False).astype(int)
-    bear += (d.macd < d.macd_signal).fillna(False).astype(int)
-    bear += ((d.rsi <= 50) & (d.rsi >= 30)).fillna(False).astype(int)
-    bear += d.bear_engulf.fillna(False).astype(int)
-    bear += d.bear_sweep.fillna(False).astype(int)
-    d["bull_score"] = score
+
+    bull += (d["close"] > d["ema21"]).fillna(False).astype(int)
+    bull += (d["ema9"] > d["ema21"]).fillna(False).astype(int)
+    bull += (d["macd"] > d["macd_signal"]).fillna(False).astype(int)
+    bull += (
+        (d["rsi"] >= 50) & (d["rsi"] <= 70)
+    ).fillna(False).astype(int)
+    bull += d["bull_engulf"].fillna(False).astype(int)
+    bull += d["bull_sweep"].fillna(False).astype(int)
+
+    bear += (d["close"] < d["ema21"]).fillna(False).astype(int)
+    bear += (d["ema9"] < d["ema21"]).fillna(False).astype(int)
+    bear += (d["macd"] < d["macd_signal"]).fillna(False).astype(int)
+    bear += (
+        (d["rsi"] >= 30) & (d["rsi"] <= 50)
+    ).fillna(False).astype(int)
+    bear += d["bear_engulf"].fillna(False).astype(int)
+    bear += d["bear_sweep"].fillna(False).astype(int)
+
+    d["bull_score"] = bull
     d["bear_score"] = bear
-    d["signal"] = np.where(score >= 4, "CALL", np.where(bear >= 4, "PUT", "WAIT"))
-    d["confidence_score"] = np.where(d.signal == "CALL", score,
-                              np.where(d.signal == "PUT", bear, np.maximum(score, bear)))
+
+    d["signal"] = np.where(
+        (bull >= 4) & (bull > bear),
+        "BUY",
+        np.where(
+            (bear >= 4) & (bear > bull),
+            "SELL",
+            "WAIT"
+        )
+    )
+
+    d["confidence_score"] = np.where(
+        d["signal"] == "BUY",
+        bull,
+        np.where(
+            d["signal"] == "SELL",
+            bear,
+            np.maximum(bull, bear)
+        )
+    )
+
     return d
 
-def backtest(d, max_rows, expiry):
-    # Signal on candle i is evaluated against the close direction of candle i+1.
-    x = d.tail(max_rows).copy().reset_index(drop=True)
-    x["next_open"] = x.open.shift(-1)
-    x["next_close"] = x.close.shift(-1)
-    x["outcome"] = np.where(x.next_close > x.next_open, "GREEN",
-                     np.where(x.next_close < x.next_open, "RED", "DOJI"))
-    valid = x.signal.isin(["CALL", "PUT"]) & x.next_close.notna()
-    trades = x.loc[valid].copy()
-    trades["win"] = ((trades.signal == "CALL") & (trades.outcome == "GREEN")) | (
-        (trades.signal == "PUT") & (trades.outcome == "RED"))
-    return x, trades
 
-uploaded = st.file_uploader("ঐতিহাসিক ক্যান্ডেলের CSV আপলোড করুন", type=["csv"])
-st.caption("প্রয়োজনীয় কলাম: open, high, low, close। ঐচ্ছিক: timestamp বা time।")
-with st.expander("CSV ফরম্যাটের উদাহরণ"):
-    st.code("timestamp,open,high,low,close\n2026-01-01 10:00,1.1000,1.1010,1.0990,1.1005\n2026-01-01 10:01,1.1005,1.1020,1.1000,1.1015", language="csv")
+def run_backtest(df, limit):
+    x = df.tail(limit).copy().reset_index(drop=True)
 
-c1, c2 = st.columns(2)
-with c1:
-    market = st.selectbox("Market type", ["LIVE historical feed", "Quotex OTC historical feed", "Other OHLC data"])
-with c2:
-    timeframe = st.selectbox("Timeframe", ["M1", "M2", "M5", "M15"])
+    x["next_open"] = x["open"].shift(-1)
+    x["next_close"] = x["close"].shift(-1)
 
-max_rows = st.select_slider("সর্বোচ্চ ব্যাকটেস্ট ক্যান্ডেল", options=[100, 500, 2000, 3000, 10000, 20000, 30000, 50000], value=10000)
-expiry = st.selectbox("Evaluation horizon", ["Next candle (1 candle)"], index=0)
+    x["outcome"] = np.where(
+        x["next_close"] > x["next_open"],
+        "GREEN",
+        np.where(
+            x["next_close"] < x["next_open"],
+            "RED",
+            "DOJI"
+        )
+    )
 
-if uploaded:
+    trades = x[
+        x["signal"].isin(["BUY", "SELL"]) &
+        x["next_close"].notna()
+    ].copy()
+
+    trades["win"] = (
+        ((trades["signal"] == "BUY") &
+         (trades["outcome"] == "GREEN")) |
+        ((trades["signal"] == "SELL") &
+         (trades["outcome"] == "RED"))
+    )
+
+    decisive = trades[trades["outcome"].isin(["GREEN", "RED"])]
+
+    return x, trades, decisive
+
+
+st.subheader("CSV Data Upload")
+
+uploaded = st.file_uploader(
+    "ঐতিহাসিক ক্যান্ডেলের CSV আপলোড করুন",
+    type=["csv"]
+)
+
+st.caption("প্রয়োজনীয় কলাম: open, high, low, close")
+
+market = st.selectbox(
+    "Market Type",
+    [
+        "Forex Historical Data",
+        "Quotex OTC Historical Data",
+        "Other OHLC Data"
+    ]
+)
+
+timeframe = st.selectbox(
+    "Timeframe",
+    ["M1", "M2", "M5", "M15"]
+)
+
+limit = st.select_slider(
+    "Backtest Candles",
+    options=[100, 500, 2000, 3000, 10000, 20000, 30000, 50000],
+    value=10000
+)
+
+
+if uploaded is not None:
     try:
         raw = pd.read_csv(uploaded)
-        data = signals(enrich(raw))
-        st.success(f"ডেটা লোড হয়েছে: {len(data):,}টি পরিষ্কার ক্যান্ডেল")
-        if market == "Quotex OTC historical feed":
-            st.info("OTC নির্বাচন করা হয়েছে। নিশ্চিত করুন CSV-টি Quotex OTC থেকেই নেওয়া; অন্য ব্রোকারের ডেটা OTC-এর বিকল্প নয়।")
-        tested, trades = backtest(data, max_rows, expiry)
-        a, b, c, e = st.columns(4)
-        wins = int(trades.win.sum()) if len(trades) else 0
-        losses = int((~trades.win).sum()) if len(trades) else 0
-        rate = 100*wins/len(trades) if len(trades) else 0
+        data, removed = analyze_data(raw)
+        data = make_signals(data)
+
+        st.success(f"লোড হয়েছে: {len(data):,}টি ক্যান্ডেল")
+
+        if removed:
+            st.warning(f"{removed}টি ভুল ক্যান্ডেল বাদ দেওয়া হয়েছে।")
+
+        if market == "Quotex OTC Historical Data":
+            st.info(
+                "OTC ফলাফল যাচাই করতে আসল Quotex OTC ডেটা ব্যবহার করুন।"
+            )
+
+        latest = data.iloc[-1]
+
+        st.divider()
+        st.subheader("LATEST SIGNAL")
+
+        if latest["signal"] == "BUY":
+            st.success("🟢 BUY / CALL")
+        elif latest["signal"] == "SELL":
+            st.error("🔴 SELL / PUT")
+        else:
+            st.warning("🟡 WAIT")
+
+        a, b, c, d = st.columns(4)
+
+        a.metric("Price", f"{latest['close']:.6f}")
+        b.metric(
+            "RSI",
+            f"{latest['rsi']:.2f}" if pd.notna(latest["rsi"]) else "N/A"
+        )
+        c.metric(
+            "Bull Score",
+            f"{int(latest['bull_score'])}/6"
+        )
+        d.metric(
+            "Bear Score",
+            f"{int(latest['bear_score'])}/6"
+        )
+
+        st.caption(
+            "স্কোর হলো নিয়মভিত্তিক ইন্ডিকেটর গণনা, "
+            "এটি জয়ের সম্ভাবনা নয়।"
+        )
+
+        st.subheader("INDICATOR ANALYSIS")
+
+        x1, x2, x3 = st.columns(3)
+        x1.metric("EMA 9", f"{latest['ema9']:.6f}")
+        x2.metric("EMA 21", f"{latest['ema21']:.6f}")
+        x3.metric("EMA 50", f"{latest['ema50']:.6f}")
+
+        y1, y2, y3 = st.columns(3)
+        y1.metric("MACD", f"{latest['macd']:.6f}")
+        y2.metric("MACD Signal", f"{latest['macd_signal']:.6f}")
+        y3.metric("RSI", f"{latest['rsi']:.2f}")
+
+        st.subheader("SUPPORT & RESISTANCE")
+
+        s1, s2 = st.columns(2)
+
+        s1.metric(
+            "Support",
+            f"{latest['support']:.6f}"
+            if pd.notna(latest["support"]) else "N/A"
+        )
+
+        s2.metric(
+            "Resistance",
+            f"{latest['resistance']:.6f}"
+            if pd.notna(latest["resistance"]) else "N/A"
+        )
+
+        tested, trades, decisive = run_backtest(data, limit)
+
+        st.divider()
+        st.subheader("BACKTEST RESULTS")
+
+        wins = int(decisive["win"].sum())
+        losses = int((~decisive["win"]).sum())
+        dojis = int((trades["outcome"] == "DOJI").sum())
+
+        total = wins + losses
+
+        rate = 100 * wins / total if total else 0
+
+        a, b, c, d = st.columns(4)
+
         a.metric("Signals", f"{len(trades):,}")
         b.metric("Wins", f"{wins:,}")
         c.metric("Losses", f"{losses:,}")
-        e.metric("Win rate", f"{rate:.2f}%" if len(trades) else "N/A")
-        st.caption("এটি পরবর্তী ক্যান্ডেলের GREEN/RED দিকের hit rate; payout, tie rules, latency ও execution slippage এতে অন্তর্ভুক্ত নয়।")
-        st.subheader("সাম্প্রতিক সিগন্যাল")
-        view_cols = [c for c in ["timestamp", "time", "open", "high", "low", "close", "rsi", "bull_score", "bear_score", "signal"] if c in tested.columns]
-        st.dataframe(tested[view_cols].tail(30), use_container_width=True)
-        st.subheader("Backtest outcomes")
+        d.metric("Win Rate", f"{rate:.2f}%" if total else "N/A")
+
+        st.metric("Doji", f"{dojis:,}")
+
+        st.caption(
+            "পরবর্তী ক্যান্ডেলের GREEN/RED দিক দিয়ে ফলাফল মাপা হয়েছে। "
+            "Payout, spread, latency ও execution slippage অন্তর্ভুক্ত নয়।"
+        )
+
+        if len(decisive):
+            st.line_chart(
+                decisive["win"].astype(int)
+                .rolling(50, min_periods=1)
+                .mean() * 100
+            )
+
+        st.subheader("RECENT SIGNALS")
+
+        view_columns = [
+            c for c in [
+                "timestamp", "time", "open", "high", "low",
+                "close", "rsi", "bull_score", "bear_score", "signal"
+            ] if c in tested.columns
+        ]
+
+        st.dataframe(
+            tested[view_columns].tail(30),
+            use_container_width=True
+        )
+
+        st.subheader("TRADE DETAILS")
+
         if len(trades):
-            st.bar_chart(trades["win"].astype(int).rolling(50, min_periods=1).mean())
-            st.dataframe(trades[[c for c in ["timestamp","time","signal","outcome","win","confidence_score"] if c in trades.columns]].tail(100),
-                         use_container_width=True)
-            st.download_button("Download tested signals CSV", tested.to_csv(index=False).encode("utf-8"),
-                               "quotex_ai_tested_signals.csv", "text/csv")
+            trade_columns = [
+                c for c in [
+                    "timestamp", "time", "signal",
+                    "outcome", "win", "confidence_score"
+                ] if c in trades.columns
+            ]
+
+            st.dataframe(
+                trades[trade_columns].tail(100),
+                use_container_width=True
+            )
+
+            st.download_button(
+                "Download Signals CSV",
+                data=tested.to_csv(index=False).encode("utf-8"),
+                file_name="quotex_ai_signals.csv",
+                mime="text/csv"
+            )
         else:
-            st.warning("এই ডেটা/সেটিংসে কোনো CALL বা PUT সিগন্যাল পাওয়া যায়নি।")
-    except Exception as ex:
-        st.error(f"ডেটা পড়তে সমস্যা: {ex}")
+            st.info("এই ডেটায় কোনো পরীক্ষাযোগ্য BUY বা SELL সিগন্যাল পাওয়া যায়নি।")
+
+    except Exception as error:
+        st.error(f"সমস্যা হয়েছে: {error}")
+
 else:
-    st.info("ব্যাকটেস্ট শুরু করতে CSV আপলোড করুন। ডেটা ছাড়া ১০,০০০–৫০,০০০ ক্যান্ডেলের পরীক্ষা বা নির্ভরযোগ্য Win Rate দাবি করা যাবে না।")
+    st.info("বিশ্লেষণ শুরু করতে প্রথমে CSV ফাইল আপলোড করুন।")
+
 
 st.divider()
-st.subheader("AI Trading Assistant — প্রাথমিক সহায়ক")
-question = st.text_input("প্রশ্ন লিখুন", placeholder="যেমন: RSI 70 হলে কী বোঝায়?")
+st.subheader("TRADING ASSISTANT")
+
+question = st.text_input(
+    "প্রশ্ন লিখুন",
+    placeholder="যেমন: RSI 70 হলে কী বোঝায়?"
+)
+
 if question:
     q = question.lower()
+
     if "rsi" in q:
-        answer = "RSI হলো momentum indicator। সাধারণভাবে 70-এর ওপরে overbought এবং 30-এর নিচে oversold বলা হয়; একে একা CALL/PUT সিদ্ধান্ত হিসেবে ব্যবহার করা ঠিক নয়।"
+        answer = (
+            "RSI একটি Momentum Indicator। সাধারণত 70-এর ওপরে "
+            "Overbought এবং 30-এর নিচে Oversold বলা হয়।"
+        )
+    elif "ema" in q:
+        answer = (
+            "EMA Trend বুঝতে সাহায্য করে। EMA 9, EMA 21-এর "
+            "ওপরে থাকলে স্বল্পমেয়াদি bullish trend-এর ইঙ্গিত হতে পারে।"
+        )
+    elif "macd" in q:
+        answer = (
+            "MACD Momentum ও Trend বুঝতে সাহায্য করে। "
+            "MACD Signal Line-এর ওপরে থাকলে bullish momentum-এর ইঙ্গিত হতে পারে।"
+        )
     elif "otc" in q:
-        answer = "OTC-এর জন্য সেই নির্দিষ্ট OTC feed-এর ঐতিহাসিক ও লাইভ ডেটা দরকার। সাধারণ Forex ডেটা দিয়ে Quotex OTC যাচাই করা যায় না।"
-    elif "backtest" in q or "ব্যাকটেস্ট" in q:
-        answer = "ব্যাকটেস্টে signal candle-এর পরের candle দিয়ে ফল মাপা হয়। ভবিষ্যৎ ডেটা signal তৈরিতে ব্যবহার করা যাবে না।"
+        answer = (
+            "Quotex OTC যাচাই করতে নির্দিষ্ট OTC historical বা live data প্রয়োজন।"
+        )
     else:
-        answer = "এই সংস্করণের সহায়কটি সীমিত rule-based। পূর্ণ AI chat agent যুক্ত করতে আলাদা AI model/API সংযোগ ও নিরাপদ configuration প্রয়োজন।"
+        answer = (
+            "এই Assistant বর্তমানে সীমিত Rule-Based। "
+            "পূর্ণ AI সংযোগের জন্য আলাদা AI Model/API প্রয়োজন।"
+        )
+
     st.write(answer)
 
-st.caption("গুরুত্বপূর্ণ: এটি গবেষণা/শিক্ষামূলক প্রোটোটাইপ, বিনিয়োগ পরামর্শ নয়। Quotex-এর কোনো account credential এখানে দেবেন না।")
+
+st.caption(
+    "শিক্ষামূলক প্রোটোটাইপ। বিনিয়োগ পরামর্শ নয়। "
+    "Quotex-এর পাসওয়ার্ড বা লগইন তথ্য এখানে দেবেন না।"
+)
